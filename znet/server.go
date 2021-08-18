@@ -1,6 +1,7 @@
 package znet
 
 import "github.com/liyiweixiangmu/zinx/ziface"
+
 // IServer的接口实现，定义一个Server的服务器模块
 type Server struct {
 	// 服务器名称
