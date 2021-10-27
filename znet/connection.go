@@ -3,6 +3,7 @@ package znet
 import (
 	"errors"
 	"fmt"
+	"github.com/liyiweixiangmu/zinx/utils"
 	"github.com/liyiweixiangmu/zinx/ziface"
 	"io"
 	"net"
@@ -28,6 +29,9 @@ type Connection struct {
 
 	// 该链接处理的方法Router
 	MsgHandler ziface.IMsgHandler
+
+	// 无缓冲的管道，用于goroutine之间的消息通信
+	msgChan chan []byte
 }
 
 //初始化链接模块的方法
@@ -38,6 +42,7 @@ func NewConnection(conn *net.TCPConn, connID uint32, msgHandler ziface.IMsgHandl
 		MsgHandler: msgHandler,
 		isClosed:   false,
 		ExitChan:   make(chan bool, 1),
+		msgChan:    make(chan []byte),
 	}
 	return c
 }
@@ -82,6 +87,7 @@ func (c *Connection) StartReader() {
 				fmt.Println("Read msg data error", err)
 				break
 			}
+
 		}
 		msg.SetData(data)
 
@@ -97,9 +103,14 @@ func (c *Connection) StartReader() {
 			msg:  msg,
 		}
 
-		// 执行注册的路由方法
-		// 从路由中，找到注册绑定的Conn对应的router调用
-		go c.MsgHandler.DoMsgHandler(&req)
+		if utils.GlobalObject.WorkerPoolSize > 0 {
+			// 已经开始了工作池机制，将消息发送给工作池即可
+			c.MsgHandler.SendMsgToTaskQueue(&req)
+		} else {
+			// 执行注册的路由方法
+			// 从路由中，找到注册绑定的Conn对应的router调用
+			go c.MsgHandler.DoMsgHandler(&req)
+		}
 
 	}
 
@@ -120,19 +131,42 @@ func (c *Connection) SendMsg(msgId uint32, data []byte) error {
 	}
 
 	// 将数据发送给客户端
-	if _, err := c.Conn.Write(binaryMsg); err != nil {
-		fmt.Println("Write msg id", msgId, " error:", err)
-		return errors.New("conn write error")
-	}
+	//if _, err := c.Conn.Write(binaryMsg); err != nil {
+	//	fmt.Println("Write msg id", msgId, " error:", err)
+	//	return errors.New("conn write error")
+	//}
+
+	c.msgChan <- binaryMsg
 
 	return nil
 }
 
+// StartWriter 写消息Goroutine， 换门发送给客户端的消息模块
+func (c *Connection) StartWriter() {
+	fmt.Println("【Write Goroutine is running】")
+	defer fmt.Println(c.RemoteAddr().String(), " [conn writer exit]")
+	for {
+		select {
+		case data := <-c.msgChan:
+			// 有数据写给客户端
+			if _, err := c.Conn.Write(data); err != nil {
+				fmt.Println("Send data error", err)
+				return
+			}
+
+		case <-c.ExitChan:
+			// 代表reader退出，此时writer要退出
+			return
+		}
+	}
+}
+
 func (c *Connection) Start() {
 	fmt.Println("Conn start()... ConnID", c.ConnID)
-	//启动从当前链接的读取数据的业务
+	// 启动从当前链接的读取数据的业务
 	go c.StartReader()
-	// TODO 启动从当前链接写数据的业务
+	// 启动从当前链接写数据的业务
+	go c.StartWriter()
 
 }
 func (c *Connection) Stop() {
@@ -144,8 +178,11 @@ func (c *Connection) Stop() {
 	c.isClosed = true
 	// 关闭socket链接
 	c.Conn.Close()
+	// 告知writer关机
+	c.ExitChan <- true
 
 	close(c.ExitChan)
+	close(c.msgChan)
 }
 func (c *Connection) GetTCPConnection() *net.TCPConn {
 	return c.Conn
